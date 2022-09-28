@@ -8,7 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from itertools import combinations_with_replacement
 from scipy.signal import savgol_filter
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import r2_score
 from sklearn.cluster import KMeans
 from tensorflow.python import keras
@@ -23,7 +23,8 @@ import models_May2022 as models
 
 #%% ----------------------------------------GLOBAL VARIABLES-------------------------------------------------------
 global window_len, polyorder, epochs, mode, reg_type, period, part, learning_rate, decay_rate, num_switches
-global comb, file_name, take_every, NReg, thresh_ODE, thresh_class, predict_until, times, use_bias, keepnorm, regularizer
+global comb, file_name, take_every, NReg, thresh_ODE, thresh_class, predict_until, times, use_bias, keepnorm
+global beta_softmax, regularizer
 
 # file_name = 'C:\\Users\\HP\\Desktop\\work\\Automation\\PDE-FIND\\PDE_FIND_take2\\Oct_2021_time_Vin_VD_header.csv'
 # file_name = 'C:\\Users\\HP\\Desktop\\work\\Automation\\PDE-FIND\\PDE_FIND_take2\\a_numerical_period2bif.csv'
@@ -33,10 +34,12 @@ global comb, file_name, take_every, NReg, thresh_ODE, thresh_class, predict_unti
 file_name = 'G:\\My Drive\\SWANN\\Pycharm Project\\a_numerical_period2bif_shorter.csv'
 window_len, polyorder = 25, 1  # for Savitzky Golay filter on data, window_len must be odd
 # epochs = 8000  # for every training loop in first phase. later phases are usually longer
-epochs = 10400
+epochs = 20000
+batch_size = 1200
 # mode = 'real'  # measurements from the RLD circuit or numerical calculation of chaotic Duffing oscillator
 mode = 'period doubling bif'
-reg_type = 'softmax_switch_double_sparse'
+# reg_type = 'softmax_switch_double_sparse'
+reg_type = 'mysoftmax_switch_double_sparse'
 part = 1  # how much of the data should be trained upon
 num_switches = 2  # how many switches the model will have
 keepnorm = 0
@@ -53,6 +56,7 @@ predict_until = 20000  # how much data points to predict in "full prediction"
 times = 16  # how many times to reg under same model architecture
 use_bias = False  # Should the model use a bias in the regression
 regularizer = 1  # 1 for regression with regularizer, 0 for w/out
+beta_softmax = 3  # prefactor indisde exponent for custom activation function "mysoftmax"
 
 #%% ---------------------------------- Models (Classes) ---------------------------------------------------------------
 
@@ -345,7 +349,7 @@ denoter[:int(len(dataset_lng[:, 0])/2)] = -1
 
 # use only relevant ones
 dataset_lng = np.transpose(np.array([dataset_lng[:, 3], dataset_lng[:, 8],
-                                     dataset_lng[:, 1],
+                                     # dataset_lng[:, 1],
                                      denoter,
                                      dataset_lng[:, -1]]))
 
@@ -441,6 +445,47 @@ weight, train_predictions, test_predictions, all_pred_by_time, history, r2 = reg
                                                                                   optimizer, regularizer,
                                                                                   earlyStop)
 
+#%% ------------------------------------------------- REG 2ND STYLE------------------------------------------
+K=5
+X = dataset[:, :-1]
+y = dataset[:, -1]
+
+for train, test in KFold(n_splits=K, shuffle=True).split(dataset[:, :-1], dataset[:, -1]):
+
+    dataset_norm = normalizer(dataset[:, :-1])
+
+    tf.keras.backend.clear_session()
+    model = models.MyModel(reg_type, num_switches, normalizer, [int(dataset_norm.shape[1]), n_coeffs],
+                           regularizer_ODE=0, regularizer_classif=0, use_bias=use_bias)
+
+    # compile model with new shuffled data
+    model.model_compile(optimizer=optimizer)
+
+    # fit
+    earlyStop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=840)
+    history = model.model.fit(X[train], y[train], callbacks=[earlyStop], validation_data=(X[test], y[test]),
+                        epochs=epochs, batch_size=batch_size).history
+
+    weight = model.get_weights()
+    wts_means = weight[0].numpy()
+    wts_var = weight[1].numpy()
+
+    train_predictions = model.predictor(X[train]).flatten()
+    test_predictions = model.predictor(X[test]).flatten()
+    all_pred_by_time = model.predictor(dataset[:predict_until, :-1]).flatten()
+
+    # note R squared
+    r2 = r2_score(y[test], test_predictions)
+    print("R2 score on training set is: {:0.3f}".format(r2_score(y[train], train_predictions)))
+    print("R2 score on test set is: {:0.3f}".format(r2))
+
+
+fig7, ax7 = plt.subplots(1,1)
+ax7.plot(y[train])
+ax7.plot(y[test])
+plt.show()
+
+
 #%% ------------------------------------------- SAVE AND PLOTS -----------------------------------------------
 # add wts to lsts
 if type != 'LR':
@@ -496,10 +541,16 @@ ax4.set_xlabel('time')
 ax4.set_ylabel('dV/dt')
 plt.legend(['measured', 'predicted sparse', 'predicted'])
 
-bias_calc = np.mean(dataset_lng[:, 0], axis=0) - np.mean(dataset_lng[:, 1], axis=0) - np.sqrt(0.01) * 1 / 3
+bias_calc_up = np.mean(dataset_lng[:, 0], axis=0) - np.mean(dataset_lng[:, 1], axis=0) - np.sqrt(0.01) * 1 / 3
+bias_calc_down = - np.mean(dataset_lng[:, 0], axis=0) - np.mean(dataset_lng[:, 1], axis=0) + np.sqrt(0.01) * 1 / 3
 # wts_transf_back = wts_ODE[-1] / np.insert(np.std(dataset[:, :-1], axis=0), 0, bias_calc)  # old
 wts_transf_back = np.array([wts_ODE[-1].T / np.std(dataset[:, :-1], axis=0)])  # new
-bias_transf_back = bias_ODE / bias_calc
+if all(bias_ODE == 0):  # if there is no use of bias
+    bias_transf_back_up = wts_ODE[-1][-1] / bias_calc_up  # two values because we can't know which model the net chose
+    bias_transf_back_down = wts_ODE[-1][-1] / bias_calc_down  # same as above
+else:
+    bias_transf_back_up = bias_ODE / bias_calc_up
+    bias_transf_back_down = bias_ODE / bias_calc_down
 
 dataset_norm = normalizer(dataset[:, :-1])
 # dynamics2 = wts_ODE[0][1] * dataset_norm[:, 0] + wts_ODE[0][2] * dataset_norm[:, 1] + wts_ODE[0][0]
@@ -515,6 +566,32 @@ plt.plot(dynamics2[:, 1] - dataset[:, -1])
 plt.show()
 fig3.show()
 fig4.show()
+
+#%% Extra plots to see if one model got good fit
+
+fig6, ax6 = plt.subplots(1, 1)
+# ax6.plot(-dataset_lng[:,0]*0.4535 - dataset_lng[:,1]*0.457 + dataset_lng[:,2]*0.107 + 1/10, 'r')
+after_soft1 = np.matmul(dataset_lng[:, :-1], wts_transf_back[:, 0].T)
+real_bias1 = np.sum(wts_ODE[-1][:, 0] * np.mean(dataset_lng[:, :-1], axis=0) / np.std(dataset_lng[:, :-1], axis=0))
+after_soft2 = np.matmul(dataset_lng[:, :-1], wts_transf_back[:, 1].T)
+real_bias2 = np.sum(wts_ODE[-1][:, 1] * np.mean(dataset_lng[:, :-1], axis=0) / np.std(dataset_lng[:, :-1], axis=0))
+dataset_from_unnormalized = (after_soft1 - real_bias1) * np.array([softmax_vec[:, 0]]).T\
+                            + 0
+                            # + (after_soft2 - real_bias2) * np.array([softmax_vec[:, 1]]).T
+
+
+ax6.plot(np.matmul(dataset_lng[:, :-1], wts_transf_back[:, 0].T), 'r')
+ax6.plot(dataset_from_unnormalized, 'b')
+ax6.plot(dataset_lng[:, -1], 'g')
+ax6.set_xlim([(np.floor(len(dataset_lng))/2).astype(int), len(dataset_lng)])
+ax6.set_ylim([-1, 2.5])
+fig6.show()
+
+#%% Calculate goodness of regularization
+
+post_regularizer1 = strength * regularizer(wts_ODE[-1][:, 0])
+post_regularizer2 = strength * regularizer(wts_ODE[-1][:, 1])
+general_loss = np.mean(np.abs(all_pred_by_time - dataset_lng[:,-1]))
 
 #%% Save
 # from prediction after nullification
