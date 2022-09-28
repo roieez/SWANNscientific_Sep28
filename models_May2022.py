@@ -3,6 +3,9 @@ import numpy as np
 import copy
 from keras import layers, regularizers
 from keras.optimizers import SGD
+from keras.utils.generic_utils import get_custom_objects
+from keras.layers.core import Activation
+import keras.backend as K
 
 
 class MyModel(tf.Module):
@@ -69,6 +72,36 @@ class MyModel(tf.Module):
             # outputs = tf.keras.layers.Dot(axes=1)([switch[:, 0:x.shape[1]], x])
 
             self.model = tf.keras.Model(inputs, outputs, name="softmax_switch_model")
+
+        elif type == 'mysoftmax_switch_double_sparse':
+            # add mysoftmax to keras
+            def mysoftmax(x, beta_softmax=2.0):
+                return K.softmax(beta_softmax * x)
+
+            get_custom_objects().update({'mysoftmax': Activation(mysoftmax)})
+
+            inputs = tf.keras.Input(shape=data_shape, name="dataset")
+            inputs_norm = normalizer(inputs[:, :take_coeffs])
+            # inputs_norm = tf.concat([inputs[:, 0:1], inputs_norm], 1)
+            # inputs_norm[:, 1:take_coeffs] = normalizer(inputs[:, 1:take_coeffs])  # if only part of coeffs are desired
+
+            if regularizer_classif == 0:
+                switch = layers.Dense(num_switches, use_bias=use_bias, activation='mysoftmax')(inputs_norm)
+            else:
+                switch = layers.Dense(num_switches, use_bias=use_bias, kernel_regularizer=regularizer_classif,
+                                      activation='mysoftmax')(inputs_norm)
+            if regularizer_ODE == 0:
+                x = layers.Dense(num_switches, use_bias=use_bias)(inputs_norm)
+            else:
+                x = layers.Dense(num_switches, use_bias=use_bias, kernel_regularizer=regularizer_ODE)(inputs_norm)
+
+            # for i in range(num_switches-1):
+            #     x = tf.concat([x, layers.Dense(1, use_bias=False, kernel_regularizer=regularizer)(inputs_norm)], axis=1)
+
+            outputs = tf.keras.layers.Dot(axes=1)([switch, x])
+            # outputs = tf.keras.layers.Dot(axes=1)([switch[:, 0:x.shape[1]], x])
+
+            self.model = tf.keras.Model(inputs, outputs, name="my_softmax_switch_doubleSparse_model")
 
         elif type == 'softmax_switch_2state':
             inputs = tf.keras.Input(shape=data_shape, name="dataset")
